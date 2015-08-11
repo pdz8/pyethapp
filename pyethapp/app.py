@@ -108,9 +108,9 @@ def app(ctx, alt_config, config_values, data_dir, log_config, bootstrap_node, lo
 
 
 @app.command()
-@click.option('--dev/--nodev', default=False, help='Exit at unhandled exceptions')
-@click.option('--nodial/--dial',  default=False, help='do not dial nodes')
-@click.option('--fake/--nofake',  default=False, help='fake genesis difficulty')
+@click.option('--dev/--nodev', default=False, help='Exit at unhandled exceptions.')
+@click.option('--nodial/--dial',  default=False, help='Do not dial nodes.')
+@click.option('--fake/--nofake',  default=False, help='Fake genesis difficulty.')
 @click.pass_context
 def run(ctx, dev, nodial, fake):
     """Start the client ( --dev to stop on error)"""
