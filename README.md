@@ -7,3 +7,5 @@ Current modifications include:
 *   Addition of a `secret` parameter to the `eth_sendTransaction` JSON-RPC command.
     This parameter can be used to specify the private key used to sign the transaction.
     It must agree with `sender`.
+
+Please refer to [the original README](https://github.com/pdz8/pyethapp/blob/master/README.rst) for installation instructions and other information.
