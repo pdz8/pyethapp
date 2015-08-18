@@ -1,0 +1,21 @@
+{
+    "folders":
+    [
+        {
+            "path": ".",
+            "folder_exclude_patterns": [
+                "build",
+                "dist",
+                "docs",
+                "examples"
+            ]
+        }
+    ],
+    "settings":
+    {
+        "rulers":
+        [
+            80
+        ]
+    }
+}

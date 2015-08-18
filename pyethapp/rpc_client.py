@@ -5,6 +5,7 @@ from tinyrpc.transports.http import HttpPostClientTransport
 from pyethapp.jsonrpc import quantity_encoder, quantity_decoder
 from pyethapp.jsonrpc import data_encoder, data_decoder, address_decoder
 from pyethapp.jsonrpc import address_encoder as _address_encoder
+from pyethapp.jsonrpc import secret_encoder
 from pyethapp.jsonrpc import default_gasprice, default_startgas
 from ethereum.transactions import Transaction
 from ethereum.keys import privtoaddr
@@ -111,12 +112,14 @@ class JSONRPCClient(object):
 
     def eth_sendTransaction(self, nonce=None, sender='', to='', value=0, data='',
                             gasPrice=default_gasprice, gas=default_startgas,
-                            v=None, r=None, s=None):
+                            v=None, r=None, s=None,
+                            secret=None):
         to = address20(to)
         encoders = dict(nonce=quantity_encoder, sender=address_encoder, to=data_encoder,
                         value=quantity_encoder, gasPrice=quantity_encoder,
                         gas=quantity_encoder, data=data_encoder,
-                        v=quantity_encoder, r=quantity_encoder, s=quantity_encoder)
+                        v=quantity_encoder, r=quantity_encoder, s=quantity_encoder,
+                        secret=secret_encoder)
         data = {k: encoders[k](v) for k, v in locals().items()
                 if k not in ('self', 'encoders') and v is not None}
         data['from'] = data.pop('sender')

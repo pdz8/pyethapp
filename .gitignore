@@ -1,3 +1,15 @@
+#################
+# pdz8 editions #
+#################
+
+sandbox/
+*.sublime-workspace
+*.html
+
+
+############
+# Original #
+############
 *.py[cod]
 
 # C extensions

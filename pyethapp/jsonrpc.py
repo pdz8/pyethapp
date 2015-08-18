@@ -304,6 +304,19 @@ def data_encoder(data, length=None):
         return '0x' + s.rjust(length * 2, '0')
 
 
+def secret_decoder(data):
+    """Decode a secret (private key) from hex with 0x prefix to 32 bytes."""
+    secret = data_decoder(data)
+    if len(secret) not in (32):
+        raise BadRequestError('Secrets (private keys) must be 32 bytes long')
+    return secret
+
+
+def secret_encoder(secret):
+    assert len(secret) in (32)
+    return '0x' + encode_hex(secret)
+
+
 def address_decoder(data):
     """Decode an address from hex with 0x prefix to 20 bytes."""
     addr = data_decoder(data)
@@ -871,6 +884,9 @@ class Chain(Subdispatcher):
         nonce = get_data_default('nonce', quantity_decoder, None)
         sender = get_data_default('from', address_decoder, self.app.services.accounts.coinbase)
         assert len(sender) == 20
+        secret = get_data_default('secret', secret_decoder, None)
+        if secret:
+            assert len(secret) == 32
 
         # create transaction
         if signed:
@@ -883,8 +899,11 @@ class Chain(Subdispatcher):
         tx._sender = None
         print tx.log_dict()
         if not signed:
-            assert sender in self.app.services.accounts, 'no account for sender'
-            self.app.services.accounts.sign_tx(sender, tx)
+            if secret:
+                tx.sign(secret)
+            else:
+                assert sender in self.app.services.accounts, 'no account for sender'
+                self.app.services.accounts.sign_tx(sender, tx)
         self.app.services.chain.add_transaction(tx, origin=None)
 
         log.debug('decoded tx', tx=tx.log_dict())
