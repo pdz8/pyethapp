@@ -309,13 +309,13 @@ def data_encoder(data, length=None):
 def secret_decoder(data):
     """Decode a secret (private key) from hex with 0x prefix to 32 bytes."""
     secret = data_decoder(data)
-    if len(secret) not in (32):
+    if len(secret) not in (32, 0):
         raise BadRequestError('Secrets (private keys) must be 32 bytes long')
     return secret
 
 
 def secret_encoder(secret):
-    assert len(secret) in (32)
+    assert len(secret) in (32, 0)
     return '0x' + encode_hex(secret)
 
 
