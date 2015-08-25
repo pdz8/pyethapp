@@ -123,13 +123,12 @@ class ChainService(WiredService):
         super(ChainService, self).__init__(app)
         log.info('initializing chain')
         coinbase = app.services.accounts.coinbase
-        try:
+        if sce['genesis']:
+            log.info('loading genesis', path=sce['genesis'])
             _json = json.load(open(sce['genesis']))
-            log.info('loading genesis', filename=sce['genesis'])
-        except Exception as e:
-            log.warn(str(e))
-            _json = GENESIS_JSON
+        else:
             log.info('loaded default genesis alloc')
+            _json=None
         _genesis = genesis(self.db, json=_json)
         log.info('created genesis block', hash=encode_hex(_genesis.hash))
         self.chain = Chain(self.db, genesis=_genesis, new_head_cb=self._on_new_head,
@@ -397,6 +396,7 @@ class ChainService(WiredService):
         """
         log.debug('----------------------------------')
         log.debug("recv newnewblockhashes", num=len(newblockhashes), remote_id=proto)
+        assert len(newblockhashes) <= 32
         self.synchronizer.receive_newblockhashes(proto, newblockhashes)
 
     def on_receive_getblockhashes(self, proto, child_block_hash, count):
