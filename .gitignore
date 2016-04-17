@@ -21,6 +21,7 @@ sandbox/
 dist
 build
 eggs
+.eggs
 parts
 bin
 var
