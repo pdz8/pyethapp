@@ -1,38 +1,81 @@
+import warnings
 from collections import Mapping
-import json
-import yaml
 import os
+
+import click
 import ethereum
 from ethereum.blocks import Block, genesis
-from ethereum.keys import decode_hex
-from ethereum.utils import parse_int_or_hex, remove_0x_head
-import re
+from devp2p.service import BaseService
 import rlp
 import sys
+from ethereum import slogging
+import types
+
+slogging.set_level('db', 'debug')
+log = slogging.get_logger('db')
 
 
-def _load_contrib_services(config):  # FIXME
+def load_contrib_services(config):  # FIXME
     # load contrib services
+    config_directory = config['data_dir']
     contrib_directory = os.path.join(config_directory, 'contrib')  # change to pyethapp/contrib
     contrib_modules = []
-    for directory in config['app']['contrib_dirs']:
-        sys.path.append(directory)
-        for filename in os.listdir(directory):
-            path = os.path.join(directory, filename)
-            if os.path.isfile(path) and filename.endswith('.py'):
-                contrib_modules.append(import_module(filename[:-3]))
+    if not os.path.exists(contrib_directory):
+        log.info('No contrib directory found, so not loading any user services')
+        return []
+    x = os.getcwd()
+    os.chdir(config_directory)
+    for filename in os.listdir(contrib_directory):
+        if filename.endswith('.py'):
+            print filename
+            try:
+                __import__(filename[:-3])
+                library_conflict = True
+            except:
+                library_conflict = False
+            if library_conflict:
+                raise Exception("Library conflict: please rename " + filename + " in contribs")
+            sys.path.append(contrib_directory)
+            contrib_modules.append(__import__(filename[:-3]))
+            sys.path.pop()
     contrib_services = []
     for module in contrib_modules:
-        classes = inspect.getmembers(module, inspect.isclass)
-        for _, cls in classes:
-            if issubclass(cls, BaseService) and cls != BaseService:
-                contrib_services.append(cls)
-    log.info('Loaded contrib services', services=sorted(contrib_services.keys()))
+        print 'm', module, dir(module)
+        on_start, on_block = None, None
+        for variable in dir(module):
+            cls = getattr(module, variable)
+            if isinstance(cls, (type, types.ClassType)):
+                if issubclass(cls, BaseService) and cls != BaseService:
+                    contrib_services.append(cls)
+            if variable == 'on_block':
+                on_block = getattr(module, variable)
+            if variable == 'on_start':
+                on_start = getattr(module, variable)
+        if on_start or on_block:
+            contrib_services.append(on_block_callback_service_factory(on_start, on_block))
+    log.info('Loaded contrib services', services=contrib_services)
     return contrib_services
 
 
-def load_contrib_services():  # FIXME: import from contrib
-    return []
+def on_block_callback_service_factory(on_start, on_block):
+
+    class _OnBlockCallbackService(BaseService):
+
+        name = 'onblockservice%d' % on_block_callback_service_factory.created
+
+        def start(self):
+            super(_OnBlockCallbackService, self).start()
+            self.app.services.chain.on_new_head_cbs.append(self.cb)
+            if on_start:
+                on_start(self.app)
+
+        def cb(self, blk):
+            if on_block:
+                on_block(blk)
+    on_block_callback_service_factory.created += 1
+    return _OnBlockCallbackService
+
+on_block_callback_service_factory.created = 0
 
 
 def load_block_tests(data, db):
@@ -56,35 +99,17 @@ def load_block_tests(data, db):
             'nonce': nonce,
             'storage': acct_state['storage']
         }
-    genesis(db, start_alloc=initial_alloc)  # builds the state trie
-    genesis_block = rlp.decode(ethereum.utils.decode_hex(data['genesisRLP'][2:]), Block, db=db)
+    env = ethereum.config.Env(db=db)
+    genesis(env, start_alloc=initial_alloc)  # builds the state trie
+    genesis_block = rlp.decode(ethereum.utils.decode_hex(data['genesisRLP'][2:]), Block, env=env)
     blocks = {genesis_block.hash: genesis_block}
     for blk in data['blocks']:
         rlpdata = ethereum.utils.decode_hex(blk['rlp'][2:])
         assert ethereum.utils.decode_hex(blk['blockHeader']['parentHash']) in blocks
         parent = blocks[ethereum.utils.decode_hex(blk['blockHeader']['parentHash'])]
-        block = rlp.decode(rlpdata, Block, db=db, parent=parent)
+        block = rlp.decode(rlpdata, Block, parent=parent, env=env)
         blocks[block.hash] = block
     return sorted(blocks.values(), key=lambda b: b.number)
-
-
-def update_config_from_genesis_json(config, genesis_json_filename):
-    with open(genesis_json_filename, "r") as genesis_json_file:
-        genesis_dict = yaml.load(genesis_json_file)
-
-    config.setdefault('eth', {}).setdefault('block', {})
-    cfg = config['eth']['block']
-    cfg['GENESIS_INITIAL_ALLOC'] = genesis_dict['alloc']
-    cfg['GENESIS_DIFFICULTY'] = parse_int_or_hex(genesis_dict['difficulty'])
-    cfg['GENESIS_TIMESTAMP'] = parse_int_or_hex(genesis_dict['timestamp'])
-    cfg['GENESIS_EXTRA_DATA'] = decode_hex(remove_0x_head(genesis_dict['extraData']))
-    cfg['GENESIS_GAS_LIMIT'] = parse_int_or_hex(genesis_dict['gasLimit'])
-    cfg['GENESIS_MIXHASH'] = decode_hex(remove_0x_head(genesis_dict['mixhash']))
-    cfg['GENESIS_PREVHASH'] = decode_hex(remove_0x_head(genesis_dict['parentHash']))
-    cfg['GENESIS_COINBASE'] = decode_hex(remove_0x_head(genesis_dict['coinbase']))
-    cfg['GENESIS_NONCE'] = decode_hex(remove_0x_head(genesis_dict['nonce']))
-
-    return config
 
 
 def merge_dict(dest, source):
@@ -106,3 +131,16 @@ def merge_dict(dest, source):
                 else:
                     curr_dest[key] = curr_source[key]
     return dest
+
+
+class FallbackChoice(click.Choice):
+    def __init__(self, choices, fallbacks, fallback_warning):
+        super(FallbackChoice, self).__init__(choices)
+        self.fallbacks = fallbacks
+        self.fallback_warning = fallback_warning
+
+    def convert(self, value, param, ctx):
+        if value in self.fallbacks:
+            warnings.warn(self.fallback_warning)
+            value = self.fallbacks[value]
+        return super(FallbackChoice, self).convert(value, param, ctx)

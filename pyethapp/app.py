@@ -1,5 +1,7 @@
+# -*- coding: utf8 -*-
 from ethereum import blocks
-import monkeypatches
+from logging import StreamHandler
+from IPython.core import ultratb
 import json
 import os
 import signal
@@ -22,58 +24,71 @@ from ethereum.blocks import Block
 import ethereum.slogging as slogging
 import config as konfig
 from db_service import DBService
-from jsonrpc import JSONRPCServer
+from jsonrpc import JSONRPCServer, IPCRPCServer
 from pow_service import PoWService
 from accounts import AccountsService, Account
 from pyethapp import __version__
 from pyethapp.profiles import PROFILES, DEFAULT_PROFILE
-from pyethapp.utils import update_config_from_genesis_json, merge_dict
+from pyethapp.utils import merge_dict, load_contrib_services, FallbackChoice
 import utils
 
 log = slogging.get_logger('app')
 
 
 services = [DBService, AccountsService, NodeDiscovery, PeerManager, ChainService, PoWService,
-            JSONRPCServer, Console]
+            JSONRPCServer, IPCRPCServer, Console]
 
 
 class EthApp(BaseApp):
-    client_version = 'pyethapp/v%s/%s/%s' % (__version__, sys.platform,
-                                             'py%d.%d.%d' % sys.version_info[:3])
+    client_name = 'pyethapp'
+    client_version = '%s/%s/%s' % (__version__, sys.platform,
+                                   'py%d.%d.%d' % sys.version_info[:3])
+    client_version_string = '%s/v%s' % (client_name, client_version)
+    start_console = False
     default_config = dict(BaseApp.default_config)
-    default_config['client_version'] = client_version
+    default_config['client_version_string'] = client_version_string
     default_config['post_app_start_callback'] = None
+    script_globals = {}
 
 
+# TODO: Remove `profile` fallbacks in 1.4 or so
 # Separators should be underscore!
-@click.group(help='Welcome to ethapp version:{}'.format(EthApp.client_version))
-@click.option('--profile', type=click.Choice(PROFILES.keys()), default=DEFAULT_PROFILE,
-              help="Configuration profile.", show_default=True)
-@click.option('alt_config', '--Config', '-C', type=click.File(), help='Alternative config file')
+@click.group(help='Welcome to {} {}'.format(EthApp.client_name, EthApp.client_version))
+@click.option('--profile', type=FallbackChoice(
+                  PROFILES.keys(),
+                  {'frontier': 'livenet', 'morden': 'testnet'},
+                  "PyEthApp's configuration profiles have been renamed to "
+                  "'livenet' and 'testnet'. The previous values 'frontier' and "
+                  "'morden' will be removed in a future update."),
+              default=DEFAULT_PROFILE, help="Configuration profile.", show_default=True)
+@click.option('alt_config', '--Config', '-C', type=str, callback=konfig.validate_alt_config_file,
+              help='Alternative config file')
 @click.option('config_values', '-c', multiple=True, type=str,
               help='Single configuration parameters (<param>=<value>)')
-@click.option('data_dir', '--data-dir', '-d', multiple=False, type=str,
-              help='data directory')
-@click.option('log_config', '--log_config', '-l', multiple=False, type=str, default=":info",
+@click.option('alt_data_dir', '-d', '--data-dir', multiple=False, type=str,
+              help='data directory', default=konfig.default_data_dir, show_default=True)
+@click.option('-l', '--log_config', multiple=False, type=str, default=":info",
               help='log_config string: e.g. ":info,eth:debug', show_default=True)
 @click.option('--log-json/--log-no-json', default=False,
               help='log as structured json output')
-@click.option('bootstrap_node', '--bootstrap_node', '-b', multiple=False, type=str,
+@click.option('--log-file', type=click.Path(dir_okay=False, writable=True, resolve_path=True),
+              help="Log to file instead of stderr.")
+@click.option('-b', '--bootstrap_node', multiple=False, type=str,
               help='single bootstrap_node as enode://pubkey@host:port')
-@click.option('mining_pct', '--mining_pct', '-m', multiple=False, type=int, default=0,
+@click.option('-m', '--mining_pct', multiple=False, type=int, default=0,
               help='pct cpu used for mining')
 @click.option('--unlock', multiple=True, type=str,
               help='Unlock an account (prompts for password)')
 @click.option('--password', type=click.File(), help='path to a password file')
 @click.pass_context
-def app(ctx, profile, alt_config, config_values, data_dir, log_config, bootstrap_node, log_json,
-        mining_pct, unlock, password):
-
+def app(ctx, profile, alt_config, config_values, alt_data_dir, log_config, bootstrap_node, log_json,
+        mining_pct, unlock, password, log_file):
     # configure logging
-    slogging.configure(log_config, log_json=log_json)
+    slogging.configure(log_config, log_json=log_json, log_file=log_file)
 
     # data dir default or from cli option
-    data_dir = data_dir or konfig.default_data_dir
+    alt_data_dir = os.path.expanduser(alt_data_dir)
+    data_dir = alt_data_dir or konfig.default_data_dir
     konfig.setup_data_dir(data_dir)  # if not available, sets up data_dir and required config
     log.info('using data in', path=data_dir)
 
@@ -81,56 +96,71 @@ def app(ctx, profile, alt_config, config_values, data_dir, log_config, bootstrap
     # config files only contain required config (privkeys) and config different from the default
     if alt_config:  # specified config file
         config = konfig.load_config(alt_config)
+        if not config:
+            log.warning('empty config given. default config values will be used')
     else:  # load config from default or set data_dir
         config = konfig.load_config(data_dir)
 
     config['data_dir'] = data_dir
 
+    # Store custom genesis to restore if overridden by profile value
+    genesis_from_config_file = config.get('eth', {}).get('genesis')
+
     # add default config
     konfig.update_config_with_defaults(config, konfig.get_default_config([EthApp] + services))
 
-    log.DEV("Move to EthApp.default_config")
     konfig.update_config_with_defaults(config, {'eth': {'block': blocks.default_config}})
 
     # Set config values based on profile selection
     merge_dict(config, PROFILES[profile])
 
+    if genesis_from_config_file:
+        # Fixed genesis_hash taken from profile must be deleted as custom genesis loaded
+        del config['eth']['genesis_hash']
+        config['eth']['genesis'] = genesis_from_config_file
+
+    pre_cmd_line_config_genesis = config.get('eth', {}).get('genesis')
     # override values with values from cmd line
     for config_value in config_values:
         try:
             konfig.set_config_param(config, config_value)
-            # check if this is part of the default config
-            if config_value.startswith("eth.genesis"):
-                del config['eth']['genesis_hash']
         except ValueError:
             raise BadParameter('Config parameter must be of the form "a.b.c=d" where "a.b.c" '
                                'specifies the parameter to set and d is a valid yaml value '
                                '(example: "-c jsonrpc.port=5000")')
 
-    # Load genesis config
-    update_config_from_genesis_json(config, config['eth']['genesis'])
+    if pre_cmd_line_config_genesis != config.get('eth', {}).get('genesis'):
+        # Fixed genesis_hash taked from profile must be deleted as custom genesis loaded
+        if 'genesis_hash' in config['eth']:
+            del config['eth']['genesis_hash']
 
+    # Load genesis config
+    konfig.update_config_from_genesis_json(config,
+                                           genesis_json_filename_or_dict=config['eth']['genesis'])
     if bootstrap_node:
         config['discovery']['bootstrap_nodes'] = [bytes(bootstrap_node)]
     if mining_pct > 0:
         config['pow']['activated'] = True
         config['pow']['cpu_pct'] = int(min(100, mining_pct))
-    if not config['pow']['activated']:
+    if not config.get('pow', {}).get('activated'):
         config['deactivated_services'].append(PoWService.name)
 
     ctx.obj = {'config': config,
                'unlock': unlock,
-               'password': password.read().rstrip() if password else None}
+               'password': password.read().rstrip() if password else None,
+               'log_file': log_file}
     assert (password and ctx.obj['password'] is not None and len(
         ctx.obj['password'])) or not password, "empty password file"
 
 
 @app.command()
-@click.option('--dev/--nodev', default=False, help='Exit at unhandled exceptions')
-@click.option('--nodial/--dial',  default=False, help='do not dial nodes')
-@click.option('--fake/--nofake',  default=False, help='fake genesis difficulty')
+@click.option('--dev/--nodev', default=False,
+              help='Drop into interactive debugger on unhandled exceptions.')
+@click.option('--nodial/--dial',  default=False, help='Do not dial nodes.')
+@click.option('--fake/--nofake',  default=False, help='Fake genesis difficulty.')
+@click.option('--console',  is_flag=True, help='Immediately drop into interactive console.')
 @click.pass_context
-def run(ctx, dev, nodial, fake):
+def run(ctx, dev, nodial, fake, console):
     """Start the client ( --dev to stop on error)"""
     config = ctx.obj['config']
     if nodial:
@@ -153,6 +183,7 @@ def run(ctx, dev, nodial, fake):
     # development mode
     if dev:
         gevent.get_hub().SYSTEM_ERROR = BaseException
+        sys.excepthook = ultratb.VerboseTB(call_pdb=True, tb_offset=6)
         try:
             config['client_version'] += '/' + os.getlogin()
         except:
@@ -162,19 +193,41 @@ def run(ctx, dev, nodial, fake):
     # dump config
     dump_config(config)
 
+    # init and unlock accounts first to check coinbase
+    if AccountsService in services:
+        AccountsService.register_with_app(app)
+        unlock_accounts(ctx.obj['unlock'], app.services.accounts, password=ctx.obj['password'])
+        try:
+            app.services.accounts.coinbase
+        except ValueError as e:
+            log.fatal('invalid coinbase', coinbase=config.get('pow', {}).get('coinbase_hex'),
+                      error=e.message)
+            sys.exit()
+
+    app.start_console = console
+
     # register services
-    for service in services:
+    contrib_services = load_contrib_services(config)
+
+    for service in services + contrib_services:
         assert issubclass(service, BaseService)
-        if service.name not in app.config['deactivated_services']:
+        if service.name not in app.config['deactivated_services'] + [AccountsService.name]:
             assert service.name not in app.services
             service.register_with_app(app)
             assert hasattr(app.services, service.name)
 
-    unlock_accounts(ctx.obj['unlock'], app.services.accounts, password=ctx.obj['password'])
-
     # start app
     log.info('starting')
     app.start()
+
+    if ctx.obj['log_file']:
+        log.info("Logging to file %s", ctx.obj['log_file'])
+        # User requested file logging - remove stderr handler
+        root_logger = slogging.getLogger()
+        for hndlr in root_logger.handlers:
+            if isinstance(hndlr, StreamHandler) and hndlr.stream == sys.stderr:
+                root_logger.removeHandler(hndlr)
+                break
 
     if config['post_app_start_callback'] is not None:
         config['post_app_start_callback'](app)
@@ -183,7 +236,6 @@ def run(ctx, dev, nodial, fake):
     evt = Event()
     gevent.signal(signal.SIGQUIT, evt.set)
     gevent.signal(signal.SIGTERM, evt.set)
-    gevent.signal(signal.SIGINT, evt.set)
     evt.wait()
 
     # finally stop
@@ -426,9 +478,7 @@ def new_account(ctx, uuid):
         password = click.prompt('Password to encrypt private key', default='', hide_input=True,
                                 confirmation_prompt=True, show_default=False)
     account = Account.new(password, uuid=id_)
-    account.path = os.path.join(os.path.abspath(ctx.obj['config']['data_dir']),
-                                ctx.obj['config']['accounts']['keystore_dir'],
-                                account.address.encode('hex'))
+    account.path = os.path.join(app.services.accounts.keystore_dir, account.address.encode('hex'))
     try:
         app.services.accounts.add_account(account)
     except IOError:
@@ -496,8 +546,9 @@ def import_account(ctx, f, uuid):
         password = click.prompt('Password to encrypt private key', default='', hide_input=True,
                                 confirmation_prompt=True, show_default=False)
     account = Account.new(password, privkey, uuid=id_)
+    account.path = os.path.join(app.services.accounts.keystore_dir, account.address.encode('hex'))
     try:
-        app.services.accounts.add_account(account, path=account.address.encode('hex'))
+        app.services.accounts.add_account(account)
     except IOError:
         click.echo('Could not write keystore file. Make sure you have write permission in the '
                    'configured directory and check the log for further information.')

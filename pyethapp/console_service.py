@@ -1,21 +1,37 @@
 """
 Essential parts borrowed from https://github.com/ipython/ipython/pull/1654
 """
+from logging import StreamHandler, Formatter
+import os
 import signal
+import errno
+from ethereum import processblock
+import select
+import time
+import sys
+import cStringIO
+
 from devp2p.service import BaseService
 import gevent
 from gevent.event import Event
 import IPython
 import IPython.core.shellapp
 from IPython.lib.inputhook import inputhook_manager, stdin_ready
-from ethereum import slogging
+from ethereum.slogging import getLogger
 from ethereum.transactions import Transaction
-from ethereum.utils import denoms
-from ethereum import processblock
-from rpc_client import ABIContract, address20
+from ethereum.utils import denoms, normalize_address as _normalize_address, bcolors as bc
 
-import sys
+from rpc_client import ABIContract
+
+log = getLogger(__name__)
+
+ENTER_CONSOLE_TIMEOUT = 3
 GUI_GEVENT = 'gevent'
+
+
+def normalize_address(a, allow_blank=True):
+    a = a or '\0' * 20 if allow_blank else a
+    return _normalize_address(a)
 
 
 def inputhook_gevent():
@@ -59,6 +75,74 @@ class GeventInputHook(object):
 IPython.core.shellapp.InteractiveShellApp.gui.values += ('gevent',)
 
 
+class SigINTHandler(object):
+
+    def __init__(self, event):
+        self.event = event
+        self.installed = None
+        self.installed_force = None
+        self.install_handler()
+
+    def install_handler(self):
+        if self.installed_force:
+            self.installed_force.cancel()
+            self.installed_force = None
+        self.installed = gevent.signal(signal.SIGINT, self.handle_int)
+
+    def install_handler_force(self):
+        if self.installed:
+            self.installed.cancel()
+            self.installed = None
+        self.installed_force = gevent.signal(signal.SIGINT, self.handle_force)
+
+    def handle_int(self):
+        self.install_handler_force()
+
+        gevent.spawn(self._confirm_enter_console)
+
+    def handle_force(self):
+        """
+        User pressed ^C a second time. Send SIGTERM to ourself.
+        """
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    def _confirm_enter_console(self):
+        start = time.time()
+        sys.stdout.write("\n")
+        enter_console = False
+        while time.time() - start < ENTER_CONSOLE_TIMEOUT:
+            sys.stdout.write(
+                "\r{}{}Hit [ENTER], to launch console; [Ctrl+C] again to quit! [{:1.0f}s]{}".format(
+                    bc.OKGREEN, bc.BOLD, ENTER_CONSOLE_TIMEOUT - (time.time() - start),
+                    bc.ENDC))
+            sys.stdout.flush()
+            try:
+                r, _, _ = select.select([sys.stdin], [], [], .5)
+            except select.error as ex:
+                sys.stdout.write("\n")
+                # "Interrupted sytem call" means the user pressed ^C again
+                if ex.args[0] == errno.EINTR:
+                    self.handle_force()
+                    return
+                else:
+                    raise
+            if r:
+                sys.stdin.readline()
+                enter_console = True
+                break
+        if enter_console:
+            sys.stdout.write("\n")
+            self.installed_force.cancel()
+            self.event.set()
+        else:
+            sys.stdout.write(
+                "\n{}{}No answer after {}s. Resuming.{}\n".format(
+                    bc.WARNING, bc.BOLD, ENTER_CONSOLE_TIMEOUT, bc.ENDC))
+            sys.stdout.flush()
+            # Restore regular handler
+            self.install_handler()
+
+
 class Console(BaseService):
 
     """A service starting an interactive ipython session when receiving the
@@ -70,8 +154,12 @@ class Console(BaseService):
     def __init__(self, app):
         super(Console, self).__init__(app)
         self.interrupt = Event()
-        gevent.signal(signal.SIGTSTP, self.interrupt.set)
         self.console_locals = {}
+        if app.start_console:
+            self.start()
+            self.interrupt.set()
+        else:
+            SigINTHandler(self.interrupt)
 
     def _stop_app(self):
         try:
@@ -80,28 +168,39 @@ class Console(BaseService):
             pass
 
     def start(self):
+        #start console service
         super(Console, self).start()
 
         class Eth(object):
+
             """
             convenience object to interact with the live chain
             """
-            app = self.app
-            services = self.app.services
-            stop = self._stop_app
-            chainservice = self.app.services.chain
-            chain = chainservice.chain
-            latest = head = property(lambda s: s.chain.head)
-            pending = head_candidate = property(lambda s: s.chain.head_candidate)
-            coinbase = self.app.services.accounts.coinbase
 
             def __init__(this, app):
                 this.app = app
+                this.services = app.services
+                this.stop = app.stop
+                this.chainservice = app.services.chain
+                this.chain = this.chainservice.chain
+                this.coinbase = app.services.accounts.coinbase
+
+
+            @property
+            def pending(this):
+                return this.chain.head_candidate
+
+            head_candidate = pending
+
+            @property
+            def latest(this):
+                return this.chain.head
+
 
             def transact(this, to, value=0, data='', sender=None,
-                         startgas=25000, gasprice=10*denoms.szabo):
-                sender = address20(sender or this.coinbase)
-                to = address20(to)
+                         startgas=25000, gasprice=60 * denoms.shannon):
+                sender = normalize_address(sender or this.coinbase)
+                to = normalize_address(to, allow_blank=True)
                 nonce = this.pending.get_nonce(sender)
                 tx = Transaction(nonce, gasprice, startgas, to, value, data)
                 this.app.services.accounts.sign_tx(sender, tx)
@@ -110,9 +209,9 @@ class Console(BaseService):
                 return tx
 
             def call(this, to, value=0, data='',  sender=None,
-                     startgas=25000, gasprice=10*denoms.szabo):
-                sender = address20(sender or this.coinbase)
-                to = address20(to)
+                     startgas=25000, gasprice=60 * denoms.shannon):
+                sender = normalize_address(sender or this.coinbase)
+                to = normalize_address(to, allow_blank=True)
                 block = this.head_candidate
                 state_root_before = block.state_root
                 assert block.has_parent()
@@ -130,7 +229,7 @@ class Console(BaseService):
                 tx.sender = sender
                 try:
                     success, output = processblock.apply_transaction(test_block, tx)
-                except processblock.InvalidTransaction as e:
+                except processblock.InvalidTransaction:
                     success = False
                 assert block.state_root == state_root_before
                 if success:
@@ -166,15 +265,85 @@ class Console(BaseService):
             serpent = None
             pass
 
-        self.console_locals = dict(eth=Eth(self.app), solidity=solc_wrapper, serpent=serpent,
-                                   denoms=denoms)
+        self.console_locals = dict(eth=Eth(self.app),solidity=solc_wrapper, serpent=serpent,
+                                    denoms=denoms, true=True, false=False, Eth=Eth)
+
+        for k, v in self.app.script_globals.items():
+            self.console_locals[k] = v
 
     def _run(self):
         self.interrupt.wait()
-        print('\n' * 3)
-        print("Entering Console")
-        print("Tip: use loglevel `-l:error` to avoid logs")
-        print(">> help(eth)")
+        print('\n' * 2)
+        print("Entering Console" + bc.OKGREEN)
+        print("Tip:" + bc.OKBLUE)
+        print("\tuse `{}lastlog(n){}` to see n lines of log-output. [default 10] ".format(
+            bc.HEADER, bc.OKBLUE))
+        print("\tuse `{}lasterr(n){}` to see n lines of stderr.".format(bc.HEADER, bc.OKBLUE))
+        print("\tuse `{}help(eth){}` for help on accessing the live chain.".format(
+            bc.HEADER, bc.OKBLUE))
+        print("\n" + bc.ENDC)
+
+        # runmultiple hack in place?
+        if hasattr(self.console_locals['eth'].app, 'apps'):
+            #print additional hint for 'runmultiple'
+            print('\n' * 2 + bc.OKGREEN)
+            print("Hint:"+ bc.OKBLUE)
+            print('\tOther nodes are accessible from {}`eth.app.apps`{}').format(
+                bc.HEADER, bc.OKBLUE)
+            print('\tThey where automatically assigned to:')
+            print("\t`{}eth1{}`".format(
+                bc.HEADER, bc.OKBLUE))
+            if len(self.console_locals['eth'].app.apps) > 3:
+                print("\t {}...{}".format(
+                    bc.HEADER, bc.OKBLUE))
+            print("\t`{}eth{}{}`".format(
+                bc.HEADER, len(self.console_locals['eth'].app.apps) - 1, bc.OKBLUE))
+            print("\n" + bc.ENDC)
+
+            # automatically assign different nodes to 'eth1.', 'eth2.'' , ....
+            Eth = self.console_locals['Eth']
+            for x in range(1, len(self.console_locals['eth'].app.apps)):
+                self.console_locals['eth' + str(x)] = Eth(self.console_locals['eth'].app.apps[x])
+
+        # Remove handlers that log to stderr
+        root = getLogger()
+        for handler in root.handlers[:]:
+            if isinstance(handler, StreamHandler) and handler.stream == sys.stderr:
+                root.removeHandler(handler)
+
+        stream = cStringIO.StringIO()
+        handler = StreamHandler(stream=stream)
+        handler.formatter = Formatter("%(levelname)s:%(name)s %(message)s")
+        root.addHandler(handler)
+
+        def lastlog(n=10, prefix=None, level=None):
+            """Print the last `n` log lines to stdout.
+            Use `prefix='p2p'` to filter for a specific logger.
+            Use `level=INFO` to filter for a specific level.
+
+            Level- and prefix-filtering are applied before tailing the log.
+            """
+            lines = (stream.getvalue().strip().split('\n') or [])
+            if prefix:
+                lines = filter(lambda line: line.split(':')[1].startswith(prefix), lines)
+            if level:
+                lines = filter(lambda line: line.split(':')[0] == level, lines)
+            for line in lines[-n:]:
+                print(line)
+
+        self.console_locals['lastlog'] = lastlog
+
+        err = cStringIO.StringIO()
+        sys.stderr = err
+
+        def lasterr(n=1):
+            """Print the last `n` entries of stderr to stdout.
+            """
+            for line in (err.getvalue().strip().split('\n') or [])[-n:]:
+                print(line)
+
+        self.console_locals['lasterr'] = lasterr
+
         IPython.start_ipython(argv=['--gui', 'gevent'], user_ns=self.console_locals)
         self.interrupt.clear()
 

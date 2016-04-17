@@ -1,7 +1,9 @@
 from itertools import count
 import json
 import pytest
+import serpent
 from devp2p.peermanager import PeerManager
+import ethereum
 from ethereum import tester
 from ethereum.ethpow import mine
 import ethereum.keys
@@ -50,7 +52,7 @@ def test_compileSolidity():
     from pyethapp.jsonrpc import Compilers, data_encoder
     import ethereum._solidity
     s = ethereum._solidity.get_solidity()
-    if s == None:
+    if s is None:
         pytest.xfail("solidity not installed, not tested")
     else:
         c = Compilers()
@@ -78,7 +80,8 @@ def test_compileSolidity():
             assert Av == Bt['info'][k]
 
 
-@pytest.mark.skipif('solidity' not in Compilers().compilers, reason="solidity compiler not available")
+@pytest.mark.skipif('solidity' not in Compilers().compilers,
+                    reason="solidity compiler not available")
 def test_compileSolidity_2():
     result = Compilers().compileSolidity(solidity_code)
     assert set(result.keys()) == {'test'}
@@ -122,6 +125,7 @@ def test_app(request, tmpdir):
                     break
             self.services.pow.recv_found_nonce(bin_nonce, mixhash, block.mining_hash)
             log.debug('block mined')
+            assert self.services.chain.chain.head.difficulty == 1
             return self.services.chain.chain.head
 
         def rpc_request(self, method, *args):
@@ -138,25 +142,6 @@ def test_app(request, tmpdir):
             log.debug('got response', response=res)
             return res
 
-    # genesis block with reduced difficulty, increased gas limit, and allocations to test accounts
-    genesis_block = {
-        "nonce": "0x0000000000000042",
-        "difficulty": "0x1",
-        "alloc": {
-            tester.accounts[0].encode('hex'): {'balance': 10**24},
-            tester.accounts[1].encode('hex'): {'balance': 1},
-            tester.accounts[2].encode('hex'): {'balance': 10**24},
-        },
-        "mixhash": "0x0000000000000000000000000000000000000000000000000000000000000000",
-        "coinbase": "0x0000000000000000000000000000000000000000",
-        "timestamp": "0x00",
-        "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
-        "extraData": "0x",
-        "gasLimit": "0x2fefd8"
-    }
-    genesis_block_file = tmpdir.join('test_genesis_block.json')
-    genesis_block_file.write(json.dumps(genesis_block))
-
     config = {
         'data_dir': str(tmpdir),
         'db': {'implementation': 'EphemDB'},
@@ -171,11 +156,23 @@ def test_app(request, tmpdir):
             'boostrap_nodes': [],
             'listen_port': 29873
         },
-        'eth': {'genesis': str(genesis_block_file), 'block': ethereum.config.default_config},
+        'eth': {
+            'block': {  # reduced difficulty, increased gas limit, allocations to test accounts
+                'GENESIS_DIFFICULTY': 1,
+                'BLOCK_DIFF_FACTOR': 2,  # greater than difficulty, thus difficulty is constant
+                'GENESIS_GAS_LIMIT': 3141592,
+                'GENESIS_INITIAL_ALLOC': {
+                    tester.accounts[0].encode('hex'): {'balance': 10**24},
+                    tester.accounts[1].encode('hex'): {'balance': 1},
+                    tester.accounts[2].encode('hex'): {'balance': 10**24},
+                }
+            }
+        },
         'jsonrpc': {'listen_port': 29873}
     }
     services = [DBService, AccountsService, PeerManager, ChainService, PoWService, JSONRPCServer]
     update_config_with_defaults(config, get_default_config([TestApp] + services))
+    update_config_with_defaults(config, {'eth': {'block': ethereum.config.default_config}})
     app = TestApp(config)
     for service in services:
         service.register_with_app(app)
@@ -190,11 +187,10 @@ def test_app(request, tmpdir):
     return app
 
 
-@pytest.mark.xfail  # sender has not funds
 def test_send_transaction(test_app):
     chain = test_app.services.chain.chain
     assert chain.head_candidate.get_balance('\xff' * 20) == 0
-    sender = test_app.services.accounts.unlocked_accounts()[0].address
+    sender = test_app.services.accounts.unlocked_accounts[0].address
     assert chain.head_candidate.get_balance(sender) > 0
     tx = {
         'from': address_encoder(sender),
@@ -209,17 +205,47 @@ def test_send_transaction(test_app):
     assert chain.head.get_balance('\xff' * 20) == 1
 
     # send transactions from account which can't pay gas
-    tx['from'] = address_encoder(test_app.services.accounts.unlocked_accounts()[1].address)
+    tx['from'] = address_encoder(test_app.services.accounts.unlocked_accounts[1].address)
     tx_hash = data_decoder(test_app.rpc_request('eth_sendTransaction', tx))
     assert chain.head_candidate.get_transactions() == []
 
 
-@pytest.mark.skipif(True, reason='must timeout if it fails')
+def test_send_transaction_with_contract(test_app):
+    serpent_code = '''
+def main(a,b):
+    return(a ^ b)
+'''
+    tx_to = b'';
+    evm_code = serpent.compile(serpent_code)
+    chain = test_app.services.chain.chain
+    assert chain.head_candidate.get_balance(tx_to) == 0
+    sender = test_app.services.accounts.unlocked_accounts[0].address
+    assert chain.head_candidate.get_balance(sender) > 0
+    tx = {
+        'from': address_encoder(sender),
+        'to': address_encoder(tx_to),
+        'data': evm_code.encode('hex')
+    }
+    data_decoder(test_app.rpc_request('eth_sendTransaction', tx))
+    creates = chain.head_candidate.get_transaction(0).creates
+
+    code = chain.head_candidate.account_to_dict(creates)['code']
+    assert len(code) > 2
+    assert code != '0x'
+
+    test_app.mine_next_block()
+
+    creates = chain.head.get_transaction(0).creates
+    code = chain.head.account_to_dict(creates)['code']
+    assert len(code) > 2
+    assert code != '0x'
+
+
 def test_pending_transaction_filter(test_app):
     filter_id = test_app.rpc_request('eth_newPendingTransactionFilter')
     assert test_app.rpc_request('eth_getFilterChanges', filter_id) == []
     tx = {
-        'from': address_encoder(test_app.services.accounts.unlocked_accounts()[0].address),
+        'from': address_encoder(test_app.services.accounts.unlocked_accounts[0].address),
         'to': address_encoder('\xff' * 20)
     }
 
@@ -247,7 +273,6 @@ def test_pending_transaction_filter(test_app):
     map(test_sequence, sequences)
 
 
-@pytest.mark.skipif(True, reason='must timeout if it fails')
 def test_new_block_filter(test_app):
     filter_id = test_app.rpc_request('eth_newBlockFilter')
     assert test_app.rpc_request('eth_getFilterChanges', filter_id) == []
@@ -260,11 +285,10 @@ def test_new_block_filter(test_app):
     assert test_app.rpc_request('eth_getFilterChanges', filter_id) == []
 
 
-@pytest.mark.skipif(True, reason='must timeout if it fails')
 def test_get_logs(test_app):
     test_app.mine_next_block()  # start with a fresh block
     n0 = test_app.services.chain.chain.head.number
-    sender = address_encoder(test_app.services.accounts.unlocked_accounts()[0].address)
+    sender = address_encoder(test_app.services.accounts.unlocked_accounts[0].address)
     contract_creation = {
         'from': sender,
         'data': data_encoder(LOG_EVM)
@@ -286,11 +310,11 @@ def test_get_logs(test_app):
     })
     assert len(logs1) == 1
     assert logs1[0]['type'] == 'pending'
-    assert logs1[0]['logIndex'] == None
-    assert logs1[0]['transactionIndex'] == None
-    assert logs1[0]['transactionHash'] == None
-    assert logs1[0]['blockHash'] == None
-    assert logs1[0]['blockNumber'] == None
+    assert logs1[0]['logIndex'] is None
+    assert logs1[0]['transactionIndex'] is None
+    assert logs1[0]['transactionHash'] is None
+    assert logs1[0]['blockHash'] is None
+    assert logs1[0]['blockNumber'] is None
     assert logs1[0]['address'] == contract_address
 
     logs2 = test_app.rpc_request('eth_getLogs', {
@@ -353,11 +377,10 @@ def test_get_logs(test_app):
     assert sorted(logs7) == sorted(logs3 + logs6 + logs1)
 
 
-@pytest.mark.skipif(True, reason='must timeout if it fails')
 def test_get_filter_changes(test_app):
     test_app.mine_next_block()  # start with a fresh block
     n0 = test_app.services.chain.chain.head.number
-    sender = address_encoder(test_app.services.accounts.unlocked_accounts()[0].address)
+    sender = address_encoder(test_app.services.accounts.unlocked_accounts[0].address)
     contract_creation = {
         'from': sender,
         'data': data_encoder(LOG_EVM)
@@ -387,11 +410,11 @@ def test_get_filter_changes(test_app):
     logs.append(test_app.rpc_request('eth_getFilterChanges', pending_filter_id))
     assert len(logs[-1]) == 1
     assert logs[-1][0]['type'] == 'pending'
-    assert logs[-1][0]['logIndex'] == None
-    assert logs[-1][0]['transactionIndex'] == None
-    assert logs[-1][0]['transactionHash'] == None
-    assert logs[-1][0]['blockHash'] == None
-    assert logs[-1][0]['blockNumber'] == None
+    assert logs[-1][0]['logIndex'] is None
+    assert logs[-1][0]['transactionIndex'] is None
+    assert logs[-1][0]['transactionHash'] is None
+    assert logs[-1][0]['blockHash'] is None
+    assert logs[-1][0]['blockNumber'] is None
     assert logs[-1][0]['address'] == contract_address
     pending_log = logs[-1][0]
 

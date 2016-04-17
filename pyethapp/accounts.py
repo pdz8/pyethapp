@@ -7,7 +7,7 @@ from devp2p.service import BaseService
 from ethereum import keys
 from ethereum.slogging import get_logger
 from ethereum.utils import privtopub  # this is different  than the one used in devp2p.crypto
-from ethereum.utils import sha3
+from ethereum.utils import sha3, is_string, decode_hex, remove_0x_head
 log = get_logger('accounts')
 
 DEFAULT_COINBASE = 'de0b295669a9fd93d5f28d9ec85e40f4cb697bae'.decode('hex')
@@ -24,6 +24,7 @@ def mk_random_privkey():
 
 
 class Account(object):
+
     """Represents an account.
 
     :ivar keystore: the key store as a dictionary (as decoded from json)
@@ -47,7 +48,7 @@ class Account(object):
             self.path = None
 
     @classmethod
-    def new(cls, password, key=None, uuid=None):
+    def new(cls, password, key=None, uuid=None, path=None):
         """Create a new account.
 
         Note that this creates the account in memory and does not store it on disk.
@@ -60,7 +61,7 @@ class Account(object):
             key = mk_random_privkey()
         keystore = keys.make_keystore_json(key, password)
         keystore['id'] = uuid
-        return Account(keystore, password, None)
+        return Account(keystore, password, path)
 
     @classmethod
     def load(cls, path, password=None):
@@ -71,6 +72,8 @@ class Account(object):
         """
         with open(path) as f:
             keystore = json.load(f)
+        if not keys.check_keystore_json(keystore):
+            raise ValueError('Invalid keystore file')
         return Account(keystore, password, path=path)
 
     def dump(self, include_address=True, include_id=True):
@@ -189,6 +192,7 @@ class Account(object):
 
 
 class AccountsService(BaseService):
+
     """Service that manages accounts.
 
     At initialization, this service collects the accounts stored as key files in the keystore
@@ -202,17 +206,15 @@ class AccountsService(BaseService):
     """
 
     name = 'accounts'
-    default_config = dict(accounts=dict(keystore_dir='keystore'))
+    default_config = dict(accounts=dict(keystore_dir='keystore', must_include_coinbase=True))
 
     def __init__(self, app):
         super(AccountsService, self).__init__(app)
         self.keystore_dir = app.config['accounts']['keystore_dir']
         if not os.path.isabs(self.keystore_dir):
-            self.keystore_dir = os.path.join(app.config['data_dir'], self.keystore_dir)
-        try:
-            self.coinbase = app.config['pow']['coinbase'] or DEFAULT_COINBASE
-        except:
-            self.coinbase = DEFAULT_COINBASE
+            self.keystore_dir = os.path.abspath(os.path.join(app.config['data_dir'],
+                                                             self.keystore_dir))
+        assert os.path.isabs(self.keystore_dir)
         self.accounts = []
         if not os.path.exists(self.keystore_dir):
             log.warning('keystore directory does not exist', directory=self.keystore_dir)
@@ -234,8 +236,37 @@ class AccountsService(BaseService):
             log.warn('no accounts found')
         else:
             log.info('found account(s)', accounts=self.accounts)
-        if self.accounts:
-            self.coinbase = self.accounts[0].address
+
+    @property
+    def coinbase(self):
+        """Return the address that should be used as coinbase for new blocks.
+
+        The coinbase address is given by the config field pow.coinbase_hex. If this does not exist
+        or is `None`, the address of the first account is used instead. If there are no accounts,
+        the coinbase is `DEFAULT_COINBASE`.
+
+        :raises: :exc:`ValueError` if the coinbase is invalid (no string, wrong length) or there is
+                 no account for it and the config flag `accounts.check_coinbase` is set (does not
+                 apply to the default coinbase)
+        """
+        cb_hex = self.app.config.get('pow', {}).get('coinbase_hex')
+        if cb_hex is None:
+            if not self.accounts_with_address:
+                return DEFAULT_COINBASE
+            cb = self.accounts_with_address[0].address
+        else:
+            if not is_string(cb_hex):
+                raise ValueError('coinbase must be string')
+            try:
+                cb = decode_hex(remove_0x_head(cb_hex))
+            except (ValueError, TypeError):
+                raise ValueError('invalid coinbase')
+        if len(cb) != 20:
+            raise ValueError('wrong coinbase length')
+        if self.config['accounts']['must_include_coinbase']:
+            if cb not in (acct.address for acct in self.accounts):
+                raise ValueError('no account for coinbase')
+        return cb
 
     def add_account(self, account, store=True, include_address=True, include_id=True):
         """Add an account.
@@ -314,7 +345,7 @@ class AccountsService(BaseService):
             i += 1
         assert not os.path.exists(backup_path)
         log.info('moving old keystore file to backup location', **{'from': account.path,
-                                                                    'to': backup_path})
+                                                                   'to': backup_path})
         try:
             shutil.move(account.path, backup_path)
         except:
@@ -360,10 +391,12 @@ class AccountsService(BaseService):
         self.accounts.sort(key=lambda account: account.path)
         log.debug('account update successful')
 
+    @property
     def accounts_with_address(self):
         """Return a list of accounts whose address is known."""
         return [account for account in self if account.address]
 
+    @property
     def unlocked_accounts(self):
         """Return a list of all unlocked accounts."""
         return [account for account in self if not account.locked]
@@ -453,16 +486,24 @@ class AccountsService(BaseService):
     def sign_tx(self, address, tx):
         self.get_by_address(address).sign_tx(tx)
 
+    def propose_path(self, address):
+        return os.path.join(self.keystore_dir, address.encode('hex'))
+
     def __contains__(self, address):
         assert len(address) == 20
         return address in [a.address for a in self.accounts]
 
-    def __getitem__(self, address):
-        assert len(address) == 20
-        for a in self.accounts:
-            if a.address == address:
-                return a
-        raise KeyError
+    def __getitem__(self, address_or_idx):
+        if isinstance(address_or_idx, bytes):
+            address = address_or_idx
+            assert len(address) == 20
+            for a in self.accounts:
+                if a.address == address:
+                    return a
+            raise KeyError
+        else:
+            assert isinstance(address_or_idx, int)
+            return self.accounts[address_or_idx]
 
     def __iter__(self):
         return iter(self.accounts)

@@ -1,6 +1,7 @@
 """Provides a simple way of testing JSON RPC commands."""
 import json
 from tinyrpc.protocols.jsonrpc import JSONRPCProtocol
+from tinyrpc.protocols.jsonrpc import JSONRPCErrorResponse, JSONRPCSuccessResponse
 from tinyrpc.transports.http import HttpPostClientTransport
 from pyethapp.jsonrpc import quantity_encoder, quantity_decoder
 from pyethapp.jsonrpc import data_encoder, data_decoder, address_decoder
@@ -10,7 +11,7 @@ from pyethapp.jsonrpc import default_gasprice, default_startgas
 from ethereum.transactions import Transaction
 from ethereum.keys import privtoaddr
 from ethereum import abi
-from ethereum.utils import denoms, int_to_big_endian, big_endian_to_int
+from ethereum.utils import denoms, int_to_big_endian, big_endian_to_int, normalize_address
 
 z_address = '\x00' * 20
 
@@ -27,7 +28,7 @@ def address20(address):
 
 
 def address_encoder(a):
-    return _address_encoder(address20(a))
+    return _address_encoder(normalize_address(a))
 
 
 def block_tag_encoder(val):
@@ -39,13 +40,18 @@ def block_tag_encoder(val):
     else:
         assert not val
 
+
 def topic_encoder(t):
     assert isinstance(t, (int, long))
     return data_encoder(int_to_big_endian(t))
 
+
 def topic_decoder(t):
     return big_endian_to_int(data_decoder(t))
 
+
+class JSONRPCClientReplyError(Exception):
+    pass
 
 
 class JSONRPCClient(object):
@@ -57,6 +63,10 @@ class JSONRPCClient(object):
         self.print_communication = print_communication
         self.privkey = privkey
         self._sender = sender
+        self.port = port
+
+    def __repr__(self):
+        return '<JSONRPCClient @%d>' % self.port
 
     @property
     def sender(self):
@@ -72,7 +82,14 @@ class JSONRPCClient(object):
         if self.print_communication:
             print json.dumps(json.loads(request.serialize()), indent=2)
             print reply
-        return self.protocol.parse_reply(reply).result
+
+        jsonrpc_reply = self.protocol.parse_reply(reply)
+        if isinstance(jsonrpc_reply, JSONRPCSuccessResponse):
+            return jsonrpc_reply.result
+        elif isinstance(jsonrpc_reply, JSONRPCErrorResponse):
+            raise JSONRPCClientReplyError(jsonrpc_reply.error)
+        else:
+            raise JSONRPCClientReplyError('Unknown type of JSONRPC reply')
 
     __call__ = call
 
@@ -83,11 +100,9 @@ class JSONRPCClient(object):
         i = 0
         while True:
             block = self.call('eth_getBlockByNumber', quantity_encoder(i), True)
-            if condition(block):
+            if condition(block) or not block:
                 return block
             i += 1
-
-            return None
 
     def new_filter(self, fromBlock="", toBlock="", address=None, topics=[]):
         encoders = dict(fromBlock=block_tag_encoder, toBlock=block_tag_encoder,
@@ -104,17 +119,21 @@ class JSONRPCClient(object):
         elif isinstance(changes, bytes):
             return data_decoder(changes)
         else:
-            decoders = dict(blockHash=data_decoder, transactionHash=data_decoder, data=data_decoder,
-                            address=address_decoder, topics=lambda x: [topic_decoder(t) for t in x],
-                            blockNumber=quantity_decoder, logIndex=quantity_decoder, transactionIndex=quantity_decoder)
-            return [{k: decoders[k](v) for k, v in c.items() if v is not None} for c  in changes]
-
+            decoders = dict(blockHash=data_decoder,
+                            transactionHash=data_decoder,
+                            data=data_decoder,
+                            address=address_decoder,
+                            topics=lambda x: [topic_decoder(t) for t in x],
+                            blockNumber=quantity_decoder,
+                            logIndex=quantity_decoder,
+                            transactionIndex=quantity_decoder)
+            return [{k: decoders[k](v) for k, v in c.items() if v is not None} for c in changes]
 
     def eth_sendTransaction(self, nonce=None, sender='', to='', value=0, data='',
                             gasPrice=default_gasprice, gas=default_startgas,
                             v=None, r=None, s=None,
                             secret=None):
-        to = address20(to)
+        to = normalize_address(to, allow_blank=True)
         encoders = dict(nonce=quantity_encoder, sender=address_encoder, to=data_encoder,
                         value=quantity_encoder, gasPrice=quantity_encoder,
                         gas=quantity_encoder, data=data_encoder,
@@ -164,16 +183,21 @@ class JSONRPCClient(object):
     def lastgasprice(self):
         return quantity_decoder(self.call('eth_lastGasPrice'))
 
-    def send_transaction(self, sender, to, value=0, data='', startgas=0, gasprice=10 * denoms.szabo):
+    def send_transaction(self, sender, to, value=0, data='', startgas=0,
+                         gasprice=10 * denoms.szabo, nonce=None):
         "can send a locally signed transaction if privkey is given"
         assert self.privkey or sender
         if self.privkey:
             _sender = sender
             sender = privtoaddr(self.privkey)
             assert sender == _sender
+            # fetch nonce
+            nonce = nonce if nonce is not None else self.nonce(sender)
+        if nonce is None:
+            nonce = 0
+
+
         assert sender
-        # fetch nonce
-        nonce = self.nonce(sender)
         if not startgas:
             startgas = quantity_decoder(self.call('eth_gasLimit')) - 1
 
@@ -204,8 +228,8 @@ class ABIContract():
     def __init__(self, sender, _abi, address, call_func, transact_func):
         self._translator = abi.ContractTranslator(_abi)
         self.abi = _abi
-        self.address = address = address20(address)
-        sender = address20(sender)
+        self.address = address = normalize_address(address)
+        sender = normalize_address(sender)
         valid_kargs = set(('gasprice', 'startgas', 'value'))
 
         class abi_method(object):

@@ -2,11 +2,7 @@
 # -*- coding: utf-8 -*-
 
 
-try:
-    from setuptools import setup
-except ImportError:
-    raise
-#     from distutils.core import setup
+from setuptools import setup
 from setuptools.command.test import test as TestCommand
 
 
@@ -33,16 +29,14 @@ with open('HISTORY.rst') as history_file:
 
 install_requires = set(x.strip() for x in open('requirements.txt'))
 install_requires_replacements = {
-    'https://github.com/ethereum/pyrlp/tarball/develop#egg=rlp': 'rlp>=0.3.8',
-    'https://github.com/ethereum/pydevp2p/tarball/master#egg=devp2p': 'devp2p>=0.4.1',
-    'https://github.com/ethereum/pyethereum/tarball/develop#egg=ethereum': 'ethereum>=1.0.0',
     'https://github.com/ethereum/ethash/tarball/master#egg=pyethash': 'pyethash'}
 
 install_requires = [install_requires_replacements.get(r, r) for r in install_requires]
+test_requirements = ['ethereum-serpent>=1.8.1', 'pytest']
 
-test_requirements = ['ethereum-serpent>=1.8.1']
-
-version = '1.0.1'  # preserve format, this is read from __init__.py
+# *IMPORTANT*: Don't manually change the version here. Use the 'bumpversion' utility.
+# see: https://github.com/ethereum/pyethapp/wiki/Development:-Versions-and-Releases
+version = '1.1.2'
 
 setup(
     name='pyethapp',
@@ -55,11 +49,9 @@ setup(
     packages=[
         'pyethapp',
     ],
-    package_dir={'pyethapp': 'pyethapp'},
     package_data={
-        'pyethapp': ['data/*.json']
+        'pyethapp': ['genesisdata/*.json']
     },
-    include_package_data=True,
     license="BSD",
     zip_safe=False,
     keywords='pyethapp',

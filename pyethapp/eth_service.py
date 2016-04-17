@@ -39,7 +39,7 @@ def apply_transaction(block, tx):
     log.debug('apply_transaction ctx switch', tx=tx.hash.encode('hex')[:8])
     gevent.sleep(0.001)
     return processblock_apply_transaction(block, tx)
-processblock.apply_transaction = apply_transaction
+#processblock.apply_transaction = apply_transaction
 
 
 rlp_hash_hex = lambda data: encode_hex(sha3(rlp.encode(data)))
@@ -112,24 +112,28 @@ class ChainService(WiredService):
         if int(sce['pruning']) >= 0:
             self.db = RefcountDB(app.services.db)
             if "I am not pruning" in self.db.db:
-                raise Exception("This database was initialized as non-pruning."
-                                " Kinda hard to start pruning now.")
+                raise RuntimeError(
+                    "The database in '{}' was initialized as non-pruning. "
+                    "Can not enable pruning now.".format(self.config['data_dir']))
             self.db.ttl = int(sce['pruning'])
             self.db.db.put("I am pruning", "1")
         else:
             self.db = app.services.db
             if "I am pruning" in self.db:
-                raise Exception("This database was initialized as pruning."
-                                " Kinda hard to stop pruning now.")
+                raise RuntimeError(
+                    "The database in '{}' was initialized as pruning. "
+                    "Can not disable pruning now".format(self.config['data_dir']))
             self.db.put("I am not pruning", "1")
 
         if 'network_id' in self.db:
             db_network_id = self.db.get('network_id')
             if db_network_id != str(sce['network_id']):
-                raise Exception("This database was initialized with network_id {} "
-                                "and can not be used when connecting to network_id {}".format(
-                                    db_network_id, sce['network_id'])
-                                )
+                raise RuntimeError(
+                    "The database in '{}' was initialized with network id {} and can not be used "
+                    "when connecting to network id {}. Please choose a different data directory.".format(
+                        self.config['data_dir'], db_network_id, sce['network_id']
+                    )
+                )
 
         else:
             self.db.put('network_id', str(sce['network_id']))
@@ -145,7 +149,9 @@ class ChainService(WiredService):
 
         log.info('chain at', number=self.chain.head.number)
         if 'genesis_hash' in sce:
-            assert sce['genesis_hash'] == self.chain.genesis.hex_hash()
+            assert sce['genesis_hash'] == self.chain.genesis.hex_hash(), \
+                "Genesis hash mismatch.\n  Expected: %s\n  Got: %s" % (
+                    sce['genesis_hash'], self.chain.genesis.hex_hash())
 
         self.synchronizer = Synchronizer(self, force_sync=None)
 
@@ -169,7 +175,7 @@ class ChainService(WiredService):
         return False
 
     def _on_new_head(self, block):
-        # DEBUG('new head cbs', len(self.on_new_head_cbs))
+        log.debug('new head cbs', num=len(self.on_new_head_cbs))
         for cb in self.on_new_head_cbs:
             cb(block)
         self._on_new_head_candidate()  # we implicitly have a new head_candidate
@@ -179,10 +185,14 @@ class ChainService(WiredService):
         for cb in self.on_new_head_candidate_cbs:
             cb(self.chain.head_candidate)
 
-    def add_transaction(self, tx, origin=None):
+    def add_transaction(self, tx, origin=None, force_broadcast=False):
         if self.is_syncing:
+            if force_broadcast:
+                assert origin is None  # only allowed for local txs
+                log.debug('force broadcasting unvalidated tx')
+                self.broadcast_transaction(tx, origin=origin)
             return  # we can not evaluate the tx based on outdated state
-        log.debug('add_transaction', locked=self.add_transaction_lock.locked(), tx=tx)
+        log.debug('add_transaction', locked=(not self.add_transaction_lock.locked()), tx=tx)
         assert isinstance(tx, Transaction)
         assert origin is None or isinstance(origin, BaseProtocol)
 
@@ -209,6 +219,7 @@ class ChainService(WiredService):
         self.add_transaction_lock.release()
         if success:
             self._on_new_head_candidate()
+        return success
 
     def add_block(self, t_block, proto):
         "adds a block to the block_queue and spawns _add_block if not running"
@@ -348,13 +359,15 @@ class ChainService(WiredService):
         assert isinstance(proto, self.wire_protocol)
         # register callbacks
         proto.receive_status_callbacks.append(self.on_receive_status)
+        proto.receive_newblockhashes_callbacks.append(self.on_newblockhashes)
         proto.receive_transactions_callbacks.append(self.on_receive_transactions)
         proto.receive_getblockhashes_callbacks.append(self.on_receive_getblockhashes)
         proto.receive_blockhashes_callbacks.append(self.on_receive_blockhashes)
         proto.receive_getblocks_callbacks.append(self.on_receive_getblocks)
         proto.receive_blocks_callbacks.append(self.on_receive_blocks)
         proto.receive_newblock_callbacks.append(self.on_receive_newblock)
-        proto.receive_newblockhashes_callbacks.append(self.on_newblockhashes)
+        proto.receive_getblockhashesfromnumber_callbacks.append(
+            self.on_receive_getblockhashesfromnumber)
 
         # send status
         head = self.chain.head
@@ -475,33 +488,48 @@ class ChainService(WiredService):
         log.debug("recv newblock", block=block, remote_id=proto)
         self.synchronizer.receive_newblock(proto, block, chain_difficulty)
 
-    def on_receive_getblockheaders(self, proto, blockhashes):
+    def on_receive_getblockhashesfromnumber(self, proto, number, count):
         log.debug('----------------------------------')
-        log.debug("on_receive_getblockheaders", count=len(blockhashes))
+        log.debug("recv getblockhashesfromnumber", number=number, remote_id=proto)
         found = []
-        for bh in blockhashes[:self.wire_protocol.max_getblocks_count]:
+        count = min(count, self.wire_protocol.max_getblockhashes_count)
+        for i in range(number, number + count):
             try:
-                found.append(rlp.encode(rlp.decode(self.chain.db.get(bh))[0]))
+                h = self.chain.index.get_block_by_number(i)
+                found.append(h)
             except KeyError:
-                log.debug("unknown block requested", block_hash=encode_hex(bh))
-        if found:
-            log.debug("found", count=len(found))
-            proto.send_blockheaders(*found)
+                log.debug("unknown block requested", number=number)
+        log.debug("sending: found block_hashes", count=len(found))
+        proto.send_blockhashes(*found)
+        return
 
-    def on_receive_blockheaders(self, proto, transient_blocks):
-        log.debug('----------------------------------')
-        pass
-        # TODO: implement headers first syncing
+    # def on_receive_getblockheaders(self, proto, blockhashes):
+    #     log.debug('----------------------------------')
+    #     log.debug("on_receive_getblockheaders", count=len(blockhashes))
+    #     found = []
+    #     for bh in blockhashes[:self.wire_protocol.max_getblocks_count]:
+    #         try:
+    #             found.append(rlp.encode(rlp.decode(self.chain.db.get(bh))[0]))
+    #         except KeyError:
+    #             log.debug("unknown block requested", block_hash=encode_hex(bh))
+    #     if found:
+    #         log.debug("found", count=len(found))
+    #         proto.send_blockheaders(*found)
 
-    def on_receive_hashlookup(self, proto, hashes):
-        found = []
-        for h in hashes:
-            try:
-                found.append(utils.encode_hex(self.chain.db.get(
-                             'node:' + utils.decode_hex(h))))
-            except KeyError:
-                found.append('')
-        proto.send_hashlookupresponse(h)
+    # def on_receive_blockheaders(self, proto, transient_blocks):
+    #     log.debug('----------------------------------')
+    #     pass
+    # TODO: implement headers first syncing
 
-    def on_receive_hashlookupresponse(self, proto, hashresponses):
-        pass
+    # def on_receive_hashlookup(self, proto, hashes):
+    #     found = []
+    #     for h in hashes:
+    #         try:
+    #             found.append(utils.encode_hex(self.chain.db.get(
+    #                          'node:' + utils.decode_hex(h))))
+    #         except KeyError:
+    #             found.append('')
+    #     proto.send_hashlookupresponse(h)
+
+    # def on_receive_hashlookupresponse(self, proto, hashresponses):
+    #     pass
